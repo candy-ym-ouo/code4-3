@@ -55,12 +55,20 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/POST | `/sources` | 查询或创建来源 |
-| GET/PATCH | `/sources/:id` | 详情或更新 |
+| GET/PATCH | `/sources/:id` | 详情或更新（已归档来源只读） |
 | POST | `/sources/:id/archive` | 归档 |
 | POST | `/sources/:id/unarchive` | 取消归档 |
 | GET/POST | `/locations` | 查询或创建位置 |
 | PATCH | `/locations/:id` | 更新位置 |
 | POST | `/locations/:id/archive` | 归档位置 |
+
+来源归档规则：
+
+- 归档在事务中锁定来源并核对关联批次；仍有未结批次（批次未归档且剩余数量大于 0）时返回 `409 SOURCE_HAS_OPEN_BATCHES`。
+- 归档后来源及其联系人、电话、邮箱、地址、备注全部冻结，`PATCH` 返回 `409 SOURCE_ARCHIVED`，批次等历史引用保留。
+- 取消归档会重新进入同类型名称唯一约束；若已有同名、同类型的使用中来源，返回 `409 SOURCE_NAME_CONFLICT`。
+- 归档与取消归档均为状态翻转操作：对已经是目标状态的来源重复调用不会报错，也不会重复写入审计日志（每次真实翻转仅一条 `ARCHIVE`/`UNARCHIVE` 审计）。
+- 来源不存在时归档与取消归档都返回 `404 NOT_FOUND`。
 
 ## 4. 材料
 

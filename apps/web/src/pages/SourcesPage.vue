@@ -10,7 +10,7 @@ const dialogVisible = ref(false);
 const editingId = ref<string | null>(null);
 const rows = ref<Source[]>([]);
 const meta = reactive<ApiMeta>({ page: 1, pageSize: 20, total: 0, totalPages: 0 });
-const filters = reactive({ q: "", type: "" });
+const filters = reactive({ q: "", type: "", archived: "" });
 const form = reactive({ name: "", type: "PURCHASED", contactName: "", contactPhone: "", contactEmail: "", address: "", notes: "" });
 const typeLabels: Record<string, string> = { PURCHASED: "购买", GIFTED: "获赠", SELF_MADE: "自制", SALVAGED: "回收/捡拾", OTHER: "其他" };
 
@@ -33,6 +33,10 @@ function openCreate() {
   dialogVisible.value = true;
 }
 function openEdit(row: Source) {
+  if (row.archivedAt) {
+    ElMessage.warning("已归档来源不能修改，请先取消归档");
+    return;
+  }
   editingId.value = row.id;
   Object.assign(form, { name: row.name, type: row.type, contactName: row.contactName || "", contactPhone: row.contactPhone || "", contactEmail: row.contactEmail || "", address: row.address || "", notes: row.notes || "" });
   dialogVisible.value = true;
@@ -49,11 +53,22 @@ async function save() {
 }
 async function archive(row: Source) {
   try {
-    await ElMessageBox.confirm(`确认归档来源“${row.name}”？`, "归档来源", { type: "warning" });
+    await ElMessageBox.confirm(`确认归档来源“${row.name}”？仍有未结批次的来源不能归档，归档后联系人等信息将被冻结。`, "归档来源", { type: "warning" });
     await request(`/sources/${row.id}/archive`, { method: "POST" });
+    ElMessage.success("来源已归档");
     await load(meta.page);
   } catch (error: any) {
     if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof ApiError ? error.message : "归档失败");
+  }
+}
+async function unarchive(row: Source) {
+  try {
+    await ElMessageBox.confirm(`确认取消归档来源“${row.name}”？恢复后需保证同类型下名称唯一。`, "取消归档", { type: "warning" });
+    await request(`/sources/${row.id}/unarchive`, { method: "POST" });
+    ElMessage.success("来源已恢复使用");
+    await load(meta.page);
+  } catch (error: any) {
+    if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof ApiError ? error.message : "取消归档失败");
   }
 }
 onMounted(() => load());
@@ -66,17 +81,34 @@ onMounted(() => load());
       <el-form :inline="true" @submit.prevent="load(1)">
         <el-form-item label="关键词"><el-input v-model="filters.q" clearable @keyup.enter="load(1)" /></el-form-item>
         <el-form-item label="类型"><el-select v-model="filters.type" clearable style="width:140px"><el-option v-for="(label,value) in typeLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item>
+        <el-form-item label="状态">
+          <el-select v-model="filters.archived" clearable style="width:130px" @change="load(1)">
+            <el-option value="" label="使用中" />
+            <el-option value="true" label="已归档" />
+          </el-select>
+        </el-form-item>
         <el-form-item><el-button type="primary" @click="load(1)">搜索</el-button></el-form-item>
       </el-form>
     </section>
     <section class="panel">
       <el-table v-loading="loading" :data="rows">
-        <el-table-column label="来源" min-width="180"><template #default="{ row }"><router-link :to="`/sources/${row.id}`"><strong>{{ row.name }}</strong></router-link></template></el-table-column>
+        <el-table-column label="来源" min-width="180">
+          <template #default="{ row }">
+            <router-link :to="`/sources/${row.id}`"><strong>{{ row.name }}</strong></router-link>
+            <el-tag v-if="row.archivedAt" size="small" type="info" style="margin-left:8px">已归档</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="类型" width="120"><template #default="{ row }">{{ typeLabels[row.type] || row.type }}</template></el-table-column>
         <el-table-column label="联系人" min-width="150"><template #default="{ row }">{{ row.contactName || "未记录" }}<div class="muted">{{ row.contactPhone || row.contactEmail || "" }}</div></template></el-table-column>
         <el-table-column label="关联批次" prop="batchCount" width="100" />
         <el-table-column label="有库存批次" prop="activeBatchCount" width="110" />
-        <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openEdit(row)">编辑</el-button><el-button link type="danger" @click="archive(row)">归档</el-button></template></el-table-column>
+        <el-table-column label="操作" width="210" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" :disabled="!!row.archivedAt" @click="openEdit(row)">编辑</el-button>
+            <el-button v-if="!row.archivedAt" link type="danger" @click="archive(row)">归档</el-button>
+            <el-button v-else link type="primary" @click="unarchive(row)">取消归档</el-button>
+          </template>
+        </el-table-column>
       </el-table>
       <el-empty v-if="!loading && rows.length===0" description="还没有来源记录" />
       <el-pagination v-if="meta.total>0" style="margin-top:16px;justify-content:flex-end" layout="total, prev, pager, next" :total="meta.total" :page-size="meta.pageSize" :current-page="meta.page" @current-change="load" />

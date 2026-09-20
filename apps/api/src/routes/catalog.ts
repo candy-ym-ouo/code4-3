@@ -6,8 +6,25 @@ import { AppError } from "../lib/errors.js";
 import { parseInput } from "../lib/validation.js";
 import { parsePagination, pageMeta } from "../lib/pagination.js";
 import { writeAudit } from "../lib/audit.js";
+import { assertCanArchive, assertCanUnarchive, decideArchive } from "../lib/sourceArchive.js";
 
 type Query = Record<string, string | undefined>;
+
+function sourceToApi(row: Record<string, unknown>) {
+  return {
+    id: row.id,
+    name: row.name,
+    type: row.type,
+    contactName: row.contact_name ?? null,
+    contactPhone: row.contact_phone ?? null,
+    contactEmail: row.contact_email ?? null,
+    address: row.address ?? null,
+    notes: row.notes ?? null,
+    archivedAt: row.archived_at ?? null,
+    createdAt: row.created_at ?? null,
+    updatedAt: row.updated_at ?? null
+  };
+}
 
 export async function catalogRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Querystring: Query }>("/sources", async (request) => {
@@ -90,6 +107,7 @@ export async function catalogRoutes(app: FastifyInstance): Promise<void> {
       const before = await client.query("SELECT * FROM sources WHERE id = $1 FOR UPDATE", [request.params.id]);
       const old = before.rows[0];
       if (!old) throw new AppError(404, "NOT_FOUND", "来源不存在");
+      if (old.archived_at) throw new AppError(409, "SOURCE_ARCHIVED", "已归档来源不能修改，请先取消归档");
       const result = await client.query(
         `UPDATE sources SET
           name = coalesce($1, name), type = coalesce($2::source_type, type),
@@ -109,8 +127,8 @@ export async function catalogRoutes(app: FastifyInstance): Promise<void> {
           request.params.id
         ]
       );
-      await writeAudit(client, { actorUserId: user.id, action: "UPDATE", entityType: "SOURCE", entityId: request.params.id, beforeData: old, afterData: result.rows[0], requestId: request.id });
-      return { data: result.rows[0] };
+      await writeAudit(client, { actorUserId: user.id, action: "UPDATE", entityType: "SOURCE", entityId: request.params.id, beforeData: sourceToApi(old), afterData: sourceToApi(result.rows[0]), requestId: request.id });
+      return { data: sourceToApi(result.rows[0]) };
     });
   });
 
@@ -120,13 +138,40 @@ export async function catalogRoutes(app: FastifyInstance): Promise<void> {
   async function archiveSource(id: string, archived: boolean, request: FastifyRequest) {
     const user = (request as AuthenticatedRequest).authUser;
     return withTransaction(async (client) => {
+      const current = await client.query("SELECT * FROM sources WHERE id = $1 FOR UPDATE", [id]);
+      const row = current.rows[0];
+      if (!row) throw new AppError(404, "NOT_FOUND", "来源不存在");
+      // 数据库列为 snake_case，业务规则使用 camelCase，显式映射避免漏传。
+      const state = { archivedAt: row.archived_at, name: row.name, type: row.type };
+
+      if (archived) {
+        // 核对关联批次：未结批次（未归档且有正库存）未处理完之前拒绝归档。
+        const openBatches = await client.query(
+          "SELECT count(*)::int AS count FROM batches WHERE source_id = $1 AND status <> 'ARCHIVED' AND remaining_quantity > 0",
+          [id]
+        );
+        assertCanArchive({ state, openBatchCount: openBatches.rows[0]?.count ?? 0 });
+      } else {
+        // 取消归档会重新受 (type, lower(name)) 唯一索引约束，先核对名称是否已被占用。
+        const taken = await client.query(
+          "SELECT 1 FROM sources WHERE type = $1::source_type AND lower(name) = lower($2) AND archived_at IS NULL AND id <> $3 LIMIT 1",
+          [state.type, state.name, id]
+        );
+        assertCanUnarchive({ state, activeNameTaken: (taken.rowCount ?? 0) > 0 });
+      }
+
+      // 重复请求不构成状态翻转：直接返回当前记录，不写审计，保证同一来源同一时刻只有一条状态变更审计。
+      if (!decideArchive(state, archived).changed) return { data: sourceToApi(row) };
+
       const result = await client.query(
         "UPDATE sources SET archived_at = CASE WHEN $1 THEN now() ELSE NULL END WHERE id = $2 RETURNING *",
         [archived, id]
       );
-      if (!result.rows[0]) throw new AppError(404, "NOT_FOUND", "来源不存在");
-      await writeAudit(client, { actorUserId: user.id, action: archived ? "ARCHIVE" : "UNARCHIVE", entityType: "SOURCE", entityId: id, afterData: result.rows[0], requestId: request.id });
-      return { data: result.rows[0] };
+      await writeAudit(client, {
+        actorUserId: user.id, action: archived ? "ARCHIVE" : "UNARCHIVE", entityType: "SOURCE",
+        entityId: id, beforeData: sourceToApi(row), afterData: sourceToApi(result.rows[0]), requestId: request.id
+      });
+      return { data: sourceToApi(result.rows[0]) };
     });
   }
 
