@@ -55,9 +55,9 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/POST | `/sources` | 查询或创建来源 |
-| GET/PATCH | `/sources/:id` | 详情或更新 |
-| POST | `/sources/:id/archive` | 归档 |
-| POST | `/sources/:id/unarchive` | 取消归档 |
+| GET/PATCH | `/sources/:id` | 详情或更新（已归档来源拒绝修改，409 `SOURCE_ARCHIVED`） |
+| POST | `/sources/:id/archive` | 归档（存在未结批次时拒绝，409 `SOURCE_HAS_UNSETTLED_BATCHES`；重复归档幂等，不重复写审计） |
+| POST | `/sources/:id/unarchive` | 取消归档（恢复原名唯一性校验，同名同类型来源在用时报 409 `SOURCE_NAME_CONFLICT`；重复请求幂等） |
 | GET/POST | `/locations` | 查询或创建位置 |
 | PATCH | `/locations/:id` | 更新位置 |
 | POST | `/locations/:id/archive` | 归档位置 |

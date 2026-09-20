@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance } from "fastify";
 import { locationInputSchema, sourceInputSchema } from "@handcraft/contracts";
 import type { AuthenticatedRequest } from "../lib/auth.js";
 import { pool, withTransaction } from "../lib/db.js";
@@ -90,6 +90,7 @@ export async function catalogRoutes(app: FastifyInstance): Promise<void> {
       const before = await client.query("SELECT * FROM sources WHERE id = $1 FOR UPDATE", [request.params.id]);
       const old = before.rows[0];
       if (!old) throw new AppError(404, "NOT_FOUND", "来源不存在");
+      if (old.archived_at) throw new AppError(409, "SOURCE_ARCHIVED", "已归档来源不能修改");
       const result = await client.query(
         `UPDATE sources SET
           name = coalesce($1, name), type = coalesce($2::source_type, type),
@@ -114,21 +115,41 @@ export async function catalogRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post<{ Params: { id: string } }>("/sources/:id/archive", async (request) => archiveSource(request.params.id, true, request));
-  app.post<{ Params: { id: string } }>("/sources/:id/unarchive", async (request) => archiveSource(request.params.id, false, request));
-
-  async function archiveSource(id: string, archived: boolean, request: FastifyRequest) {
+  app.post<{ Params: { id: string } }>("/sources/:id/archive", async (request) => {
     const user = (request as AuthenticatedRequest).authUser;
     return withTransaction(async (client) => {
-      const result = await client.query(
-        "UPDATE sources SET archived_at = CASE WHEN $1 THEN now() ELSE NULL END WHERE id = $2 RETURNING *",
-        [archived, id]
+      const current = await client.query("SELECT * FROM sources WHERE id = $1 FOR UPDATE", [request.params.id]);
+      const source = current.rows[0];
+      if (!source) throw new AppError(404, "NOT_FOUND", "来源不存在");
+      if (source.archived_at) return { data: source };
+      const unsettled = await client.query(
+        "SELECT 1 FROM batches WHERE source_id = $1 AND status <> 'ARCHIVED' AND remaining_quantity > 0 LIMIT 1",
+        [request.params.id]
       );
-      if (!result.rows[0]) throw new AppError(404, "NOT_FOUND", "来源不存在");
-      await writeAudit(client, { actorUserId: user.id, action: archived ? "ARCHIVE" : "UNARCHIVE", entityType: "SOURCE", entityId: id, afterData: result.rows[0], requestId: request.id });
+      if (unsettled.rowCount) throw new AppError(409, "SOURCE_HAS_UNSETTLED_BATCHES", "来源存在未结批次，不能归档");
+      const result = await client.query("UPDATE sources SET archived_at = now() WHERE id = $1 RETURNING *", [request.params.id]);
+      await writeAudit(client, { actorUserId: user.id, action: "ARCHIVE", entityType: "SOURCE", entityId: request.params.id, beforeData: source, afterData: result.rows[0], requestId: request.id });
       return { data: result.rows[0] };
     });
-  }
+  });
+
+  app.post<{ Params: { id: string } }>("/sources/:id/unarchive", async (request) => {
+    const user = (request as AuthenticatedRequest).authUser;
+    return withTransaction(async (client) => {
+      const current = await client.query("SELECT * FROM sources WHERE id = $1 FOR UPDATE", [request.params.id]);
+      const source = current.rows[0];
+      if (!source) throw new AppError(404, "NOT_FOUND", "来源不存在");
+      if (!source.archived_at) return { data: source };
+      const conflict = await client.query(
+        "SELECT 1 FROM sources WHERE id <> $1 AND archived_at IS NULL AND type = $2 AND lower(name) = lower($3) LIMIT 1",
+        [request.params.id, source.type, source.name]
+      );
+      if (conflict.rowCount) throw new AppError(409, "SOURCE_NAME_CONFLICT", "已存在同名同类型的使用中来源，无法取消归档");
+      const result = await client.query("UPDATE sources SET archived_at = NULL WHERE id = $1 RETURNING *", [request.params.id]);
+      await writeAudit(client, { actorUserId: user.id, action: "UNARCHIVE", entityType: "SOURCE", entityId: request.params.id, beforeData: source, afterData: result.rows[0], requestId: request.id });
+      return { data: result.rows[0] };
+    });
+  });
 
   app.get<{ Querystring: Query }>("/locations", async (request) => {
     const includeArchived = request.query.archived === "true";
